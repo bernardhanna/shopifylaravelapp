@@ -3,9 +3,8 @@
  * @Author: Bernard Hanna
  * @Date:   2023-07-06 17:19:27
  * @Last Modified by:   Bernard Hanna
- * @Last Modified time: 2023-07-07 16:58:03
+ * @Last Modified time: 2023-08-16 16:13:07
  */
-
 
 namespace App\Services;
 
@@ -42,13 +41,13 @@ class ShopifyFulfillmentService
             // Get all orders from Shopify API
             $response = $client->request(
                 'GET',
-                "https://{$shop}/admin/api/{$apiVersion}/orders.json?status=any",
+                "https://{$shop}/admin/api/{$apiVersion}/orders.json?status=any&limit=250",
                 ['headers' => ['X-Shopify-Access-Token' => $token]]
             );
 
             Log::info('Shopify API request', [
                 'method' => 'GET',
-                'url' => "https://{$shop}/admin/api/{$apiVersion}/orders.json?status=any",
+                'url' => "https://{$shop}/admin/api/{$apiVersion}/orders.json?status=any&limit=250",
                 'headers' => ['X-Shopify-Access-Token' => '******'],
             ]);
 
@@ -64,6 +63,12 @@ class ShopifyFulfillmentService
             $fulfilledOrders = [];
 
             foreach ($shopifyOrders as $shopifyOrder) {
+            
+            // Skip orders with null fulfillment status
+            if ($shopifyOrder['fulfillment_status'] === null) {
+                continue;
+            }
+            
                 // Extract the basket_id from the note attribute
                 $basketId = $shopifyOrder['note'] ?? null;
 
@@ -79,7 +84,7 @@ class ShopifyFulfillmentService
                 if (!$order) {
                     continue;
                 }
-
+                Log::debug('Shopify Order Data', ['order' => $shopifyOrder]);
                 // Check if the Shopify order is fulfilled
                 if ($shopifyOrder['fulfillment_status'] === 'fulfilled') {
                     Log::debug('Order is fulfilled', ['order_id' => $shopifyOrder['id']]);
@@ -102,70 +107,68 @@ class ShopifyFulfillmentService
                             );
 
                             // Dispatch the fulfillment
-                        // Dispatch the fulfillment
-                        if ($fulfillment->dispatched_at === null) {
-                            Log::debug('About to dispatch fulfillment', ['fulfillment_id' => $fulfillment->id]);
+                            if ($fulfillment->dispatched_at === null) {
+                                Log::debug('About to dispatch fulfillment', ['fulfillment_id' => $fulfillment->id]);
 
-                            // Update the dispatched_at field before sending the dispatch request
-                            $fulfillment->dispatched = true;
-                            $fulfillment->dispatched_at = now();
-                            $fulfillment->save();
-                            Log::debug('Fulfillment marked as dispatched', ['fulfillment' => $fulfillment]);
+                                // Update the dispatched_at field before sending the dispatch request
+                                $fulfillment->dispatched = true;
+                                $fulfillment->dispatched_at = now();
+                                $fulfillment->save();
+                                Log::debug('Fulfillment marked as dispatched', ['fulfillment' => $fulfillment]);
 
-                            // Prepare the dispatch request data
-                            $url = config('app.getwaterfit.api_url') . "suppliers/api/1.0/dispatchOrder/{$order->basket_id}";
-                            $order->load('productCodes');
+                                // Prepare the dispatch request data
+                                $url = config('app.getwaterfit.api_url') . "suppliers/api/1.0/dispatchOrder/{$order->basket_id}";
+                                $order->load('productCodes');
 
-                            // Prepare the product codes data
-                            $productCodes = $order->productCodes->map(function ($productCode) {
-                                return [
-                                    "code" => $productCode->code,
-                                    "quantity" => $productCode->quantity,
-                                    "basket_item_id" => $productCode->basket_item_id
+                                // Prepare the product codes data
+                                $productCodes = $order->productCodes->map(function ($productCode) {
+                                    return [
+                                        "code" => $productCode->code,
+                                        "quantity" => $productCode->quantity,
+                                        "basket_item_id" => $productCode->basket_item_id
+                                    ];
+                                });
+
+                                // Prepare the data
+                                $data = [
+                                    "order_reference" => $order->order_reference,
+                                    "despatch_number" => strval($fulfillment->tracking_number), // convert to string
+                                    "product_codes" => $productCodes,
+                                    "quantity" => $order->productCodes->sum('quantity'),
+                                    "despatch_date" => optional($fulfillment->dispatched_at)->format('Y-m-d'),
+                                    "carrier_code" => $fulfillment->carrier_code,
+                                    "carrier_name" => $fulfillment->carrier_name,
+                                    "tracking_number" => $fulfillment->tracking_number,
+                                    "ship-method" => $order->fulfilled ? 'fulfilled' : 'unfulfilled'
                                 ];
-                            });
 
-                            // Prepare the data
-                            $data = [
-                                "order_reference" => $order->order_reference,
-                                "despatch_number" => strval($fulfillment->tracking_number), // convert to string
-                                "product_codes" => $productCodes,
-                                "quantity" => $order->productCodes->sum('quantity'),
-                                "despatch_date" => optional($fulfillment->dispatched_at)->format('Y-m-d'),
-                                "carrier_code" => $fulfillment->carrier_code,
-                                "carrier_name" => $fulfillment->carrier_name,
-                                "tracking_number" => $fulfillment->tracking_number,
-                                "ship-method" => $order->fulfilled ? 'fulfilled' : 'unfulfilled'
-                            ];
+                                Log::debug('Dispatch data prepared', ['url' => $url, 'data' => $data]);
 
-                            Log::debug('Dispatch data prepared', ['url' => $url, 'data' => $data]);
+                                // Send the PUT request
+                                try {
+                                    Log::debug('Sending dispatch request...');
+                                    $response = $client->request('PUT', $url, [
+                                        'headers' => ['Authorization' => 'Bearer ' . config('app.getwaterfit.api_token')],
+                                        'json' => $data
+                                    ]);
+                                    Log::debug('Dispatch request sent');
 
-                            // Send the PUT request
-                            try {
-                                Log::debug('Sending dispatch request...');
-                                $response = $client->request('PUT', $url, [
-                                    'headers' => ['Authorization' => 'Bearer ' . config('app.getwaterfit.api_token')],
-                                    'json' => $data
-                                ]);
-                                Log::debug('Dispatch request sent');
+                                    $responseBody = json_decode($response->getBody(), true);
+                                    Log::debug('Dispatch response received', ['response' => $responseBody]);
 
-                                $responseBody = json_decode($response->getBody(), true);
-                                Log::debug('Dispatch response received', ['response' => $responseBody]);
-
-                                if ($response->getStatusCode() != 200 || $responseBody['message'] != 'success') {
-                                    // If the dispatch request was not successful, reset the dispatched and dispatched_at fields
-                                    $fulfillment->dispatched = false;
-                                    $fulfillment->dispatched_at = null;
-                                    $fulfillment->save();
-                                    Log::debug('Fulfillment marked as not dispatched', ['fulfillment' => $fulfillment]);
+                                    if ($response->getStatusCode() != 200 || $responseBody['message'] != 'success') {
+                                        // If the dispatch request was not successful, reset the dispatched and dispatched_at fields
+                                        $fulfillment->dispatched = false;
+                                        $fulfillment->dispatched_at = null;
+                                        $fulfillment->save();
+                                        Log::debug('Fulfillment marked as not dispatched', ['fulfillment' => $fulfillment]);
+                                    }
+                                } catch (\GuzzleHttp\Exception\GuzzleException $e) {
+                                    Log::error('Dispatch request failed', ['error' => $e->getMessage(), 'url' => $url, 'data' => $data]);
+                                } catch (\Exception $e) {
+                                    Log::error('An unexpected error occurred during dispatch', ['error' => $e->getMessage(), 'url' => $url, 'data' => $data]);
                                 }
-                            } catch (\GuzzleHttp\Exception\GuzzleException $e) {
-                                Log::error('Dispatch request failed', ['error' => $e->getMessage(), 'url' => $url, 'data' => $data]);
-                            } catch (\Exception $e) {
-                                Log::error('An unexpected error occurred during dispatch', ['error' => $e->getMessage(), 'url' => $url, 'data' => $data]);
                             }
-                        }
-
                         }
                     }
 
